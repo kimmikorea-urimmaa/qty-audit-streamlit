@@ -1,0 +1,86 @@
+allowance_multiplier_map:
+  "1%": 1.01
+  "2%": 1.02
+  "3%": 1.03
+  "4%": 1.04
+  "5%": 1.05
+  "10%": 1.10
+  "30%": 1.30
+allowance_percent_extract_regex: "(\\d+(\\.\\d+)?)%"
+
+allowance_standard_rules:
+  - name: "조경석 30%"
+    priority: 100
+    multiplier: 1.30
+    keywords_any: ["조경석"]
+  - name: "철판 10%"
+    priority: 90
+    multiplier: 1.10
+    keywords_any: ["sts pl", "st pl", "철판"]
+  - name: "하드우드 10%"
+    priority: 80
+    multiplier: 1.10
+    keywords_any: ["하드우드", "hardwood"]
+  - name: "레미콘 무근 2%"
+    priority: 70
+    multiplier: 1.02
+    keywords_any: ["레미콘", "레미콘타설"]
+    require_in_row_or_bigo_any: ["무근"]
+  - name: "레미콘 철근 1%"
+    priority: 70
+    multiplier: 1.01
+    keywords_any: ["레미콘", "레미콘타설"]
+    require_in_row_or_bigo_any: ["철근", "rc"]
+  - name: "이형철근 3%"
+    priority: 60
+    multiplier: 1.03
+    keywords_any: ["이형철근", "철근"]
+  - name: "혼합골재 4%"
+    priority: 50
+    multiplier: 1.04
+    keywords_any: ["혼합골재", "골재"]
+  - name: "각관 5%"
+    priority: 50
+    multiplier: 1.05
+    keywords_any: ["각관", "아연도각관"]
+  - name: "못 5%"
+    priority: 50
+    multiplier: 1.05
+    keywords_any: ["못"]
+  - name: "건식연결철물 5%"
+    priority: 50
+    multiplier: 1.05
+    keywords_any: ["건식연결철물"]
+  - name: "셋트앵커 5%"
+    priority: 50
+    multiplier: 1.05
+    keywords_any: ["셋트앵커", "세트앵커"]
+  - name: "판석 10%"
+    priority: 20
+    multiplier: 1.10
+    keywords_any: ["판석"]
+  - name: "angle 10%"
+    priority: 10
+    multiplier: 1.10
+    keywords_any: ["angle"]
+    case_insensitive: true
+
+calc_text_check:
+  only_pure_numeric_expression: true
+  round_digits_from_e_formula: true
+  error_threshold_abs: 0.009
+
+unit_weight:
+  target_keywords: ["st pl", "sts pl", "sts pipe", "st pipe", "sts angle", "이형철근", "아연도각관"]
+  densities:
+    st_ton_m3: 7.85
+    sts304_ton_m3: 7.93
+  known_weights:
+    st_pl_t10_kg_m2: 78.50
+    sts_pl_t4_kg_m2: 31.72
+    sts_pl_t10_kg_m2: 79.30
+    sts_angle_t5_kg_m2: 39.65
+    deformed_bar_d13_kg_m: 0.995
+  notes:
+    - "angle 포함 시 39.65 kg/m2(=STS304 T5)"
+    - "아연도각관은 단위 m 단가: kg 환산 없어도 정상(kg 단위이면 HIGH)"
