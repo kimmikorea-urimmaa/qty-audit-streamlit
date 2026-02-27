@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """조경 시설물 수량산출서 자동검토 도구.
 
-정책 반영(중요):
-- 비고란에 %가 명시된 경우에만 할증대상으로 간주한다.
-  (즉, 공종명/키워드만으로 표준 할증룰을 자동 적용하지 않음)
+정책(이번 최종):
+- "할증" 관련 검토(정책위반/할증계산검증)는 **비고란에 %가 명시된 행에서만** 수행한다.
+- 비고에 %가 없으면 할증 검토는 아예 하지 않는다(오탐 방지).
+- unit_weight / calc_text_check는 비고% 유무와 무관하게 항상 수행한다.
 
 검토 항목
 1) calc_text_check:
@@ -11,12 +12,10 @@
    - E가 ROUND(…,n)이면 n 사용, 없으면 기본 n(기본 3)
    - 비교는 ROUND 자리수 기반 tol(허용오차)로 판정
 
-2) allowance_policy_check:
-   - 설치품: 비고에 % 있으면(할증 명시) HIGH (설치품은 정미량이어야 함)
-   - 재료: 비고에 % 없으면 MEDIUM (비고 없으면 할증대상 아님이라는 정책을 따르되,
-                                "재료인데 비고에 할증이 빠진 것"을 잡고 싶으면 MEDIUM 유지)
+2) allowance_policy_check (비고% 있을 때만):
+   - 설치품인데 비고에 할증%가 있으면 HIGH (설치품은 정미량이어야 함)
 
-3) allowance_check (재료 항목 + 비고% 존재 시에만):
+3) allowance_check (비고% + 재료 항목일 때만):
    - E가 D×(비고%)인지 검증
 
 4) unit_weight:
@@ -217,7 +216,6 @@ def classify_row_type(work: str, spec: str, unit: str, bigo: str, rules: Dict[st
     material_keys = [str(x).lower() for x in (rules.get("material_keywords_any") or [])]
     install_keys = [str(x).lower() for x in (rules.get("installation_keywords_any") or [])]
 
-    # 동시에 걸리면 material 우선
     if material_keys and any(k in text for k in material_keys):
         return "material"
     if install_keys and any(k in text for k in install_keys):
@@ -270,7 +268,6 @@ def build_reports(errors: List[ErrorRecord], outdir: str) -> None:
         "tol",
     ]
 
-    # CSV
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
         writer.writerow(columns)
@@ -291,13 +288,11 @@ def build_reports(errors: List[ErrorRecord], outdir: str) -> None:
                 ]
             )
 
-    # Summary 집계
     summary: Dict[Tuple[str, str], int] = {}
     for e in errors:
         key = (e.check_type, e.severity)
         summary[key] = summary.get(key, 0) + 1
 
-    # XLSX
     wb = Workbook()
     ws_summary = wb.active
     ws_summary.title = "Summary"
@@ -329,15 +324,11 @@ def build_reports(errors: List[ErrorRecord], outdir: str) -> None:
 
 def main() -> None:
     args = parse_args()
+    rules = load_rules(args.rules)
+
+    from openpyxl import load_workbook
 
     try:
-        rules = load_rules(args.rules)
-    except Exception as e:
-        raise SystemExit(f"[ERROR] rules 로드 실패: {e}")
-
-    try:
-        from openpyxl import load_workbook
-
         wb_formula = load_workbook(args.xlsx, data_only=False)
         wb_value = load_workbook(args.xlsx, data_only=True)
     except Exception as e:
@@ -354,7 +345,6 @@ def main() -> None:
 
     default_round_digits = int(rules.get("round_default_digits", 3))
     sev_install_has_allowance = str(rules.get("policy_installation_has_allowance_severity", "HIGH"))
-    sev_material_missing_allowance = str(rules.get("policy_material_missing_allowance_severity", "MEDIUM"))
 
     errors: List[ErrorRecord] = []
 
@@ -370,22 +360,20 @@ def main() -> None:
         if not any([work, spec, d_formula_or_text, e_formula, unit, bigo]):
             continue
 
-        # ROUND 자리수/허용오차
+        # --- ROUND 자리수/허용오차(행 공통) ---
         round_digits = get_round_digits_for_row(e_formula, default_digits=default_round_digits)
         tol = tol_from_round_digits(round_digits)
 
-        # 행 유형(재료/설치품)
+        # --- 행 유형(재료/설치품/unknown) ---
         row_type = classify_row_type(work, spec, unit, bigo, rules)
 
-        # 1) calc_text_check
+        # --- (A) calc_text_check: 항상 수행 ---
         d_numeric: Optional[float] = None
         if d_formula_or_text and not has_cell_reference(d_formula_or_text):
             d_numeric = safe_eval_numeric(d_formula_or_text)
-
             if d_numeric is not None and e_value is not None:
                 expected = round(d_numeric, round_digits)
                 diff = abs(expected - e_value)
-
                 if diff > tol:
                     errors.append(
                         ErrorRecord(
@@ -403,23 +391,46 @@ def main() -> None:
                         )
                     )
 
-        # === 할증 감지(중요): 비고에 %가 있을 때만 ===
-        percent_text: Optional[str] = None
+        # --- (B) unit_weight: 항상 수행 ---
+        for sev, reason, rule_name in unit_weight_check(work, spec, unit):
+            errors.append(
+                ErrorRecord(
+                    row=r,
+                    cell=f"F{r}",
+                    check_type="unit_weight",
+                    reason=reason,
+                    severity=sev,
+                    rule_name=rule_name,
+                )
+            )
+
+        # ============================
+        # (C) 할증 검토: 비고% 있을 때만
+        # ============================
         m = percent_regex.search(bigo)
-        if m:
-            percent_text = f"{m.group(1)}%"
+        if not m:
+            continue  # 할증 관련 검토만 스킵 (A,B는 이미 수행함)
 
-        selected_rule: Optional[Dict[str, Any]] = None
-        if percent_text and percent_text in allowance_map:
-            selected_rule = {
-                "name": f"비고 퍼센트({percent_text})",
-                "multiplier": float(allowance_map[percent_text]),
-            }
+        percent_text = f"{m.group(1)}%"
+        if percent_text not in allowance_map:
+            errors.append(
+                ErrorRecord(
+                    row=r,
+                    cell=f"G{r}",
+                    check_type="allowance_check",
+                    reason=f"비고에 '{percent_text}'가 있으나 allowance_multiplier_map에 정의되지 않음",
+                    severity="MEDIUM",
+                    related_formula=f"BIGO:{bigo}",
+                    rule_name="allowance_multiplier_map missing",
+                )
+            )
+            continue
 
-        allowance_detected = selected_rule is not None
+        multiplier = float(allowance_map[percent_text])
+        rule_name = f"비고 퍼센트({percent_text})"
 
-        # 2) 정책 검사: 설치품은 할증(%)이 있으면 안 됨
-        if row_type == "installation" and allowance_detected:
+        # (C-1) 설치품인데 비고에 할증%가 있으면 정책 위반
+        if row_type == "installation":
             errors.append(
                 ErrorRecord(
                     row=r,
@@ -428,32 +439,15 @@ def main() -> None:
                     reason="설치품(정미량) 항목인데 비고에 할증(%)이 명시됨",
                     severity=sev_install_has_allowance,
                     related_formula=f"D:{d_formula_or_text} | E:{e_formula} | BIGO:{bigo}",
-                    rule_name=str(selected_rule.get("name", "")),
+                    rule_name=rule_name,
                 )
             )
+            continue
 
-        # 3) 정책 검사: 재료인데 비고에 %가 없으면(=할증대상 아님) → '누락 가능' 경고
-        #    네 정책을 엄격히 따르면 '오류'는 아니지만, 실무상 놓친 케이스를 잡기 위해 MEDIUM으로 유지.
-        #    만약 이 경고 자체를 끄고 싶으면 severity를 "OFF" 같은 값으로 바꾸거나 이 블록을 제거하면 됨.
-        if row_type == "material" and not allowance_detected:
-            errors.append(
-                ErrorRecord(
-                    row=r,
-                    cell=f"E{r}",
-                    check_type="allowance_policy_check",
-                    reason="재료 항목인데 비고에 할증(%) 표기가 없음(정책상 할증 비대상이지만, 할증 누락 가능)",
-                    severity=sev_material_missing_allowance,
-                    related_formula=f"D:{d_formula_or_text} | E:{e_formula} | BIGO:{bigo}",
-                    rule_name="(no allowance in BIGO)",
-                )
-            )
-
-        # 4) allowance_check: 재료 + 비고% 있을 때만 검증
-        if row_type == "material" and allowance_detected and d_numeric is not None and e_value is not None:
-            applied_multiplier = float(selected_rule["multiplier"])
-            expected = round(d_numeric * applied_multiplier, round_digits)
+        # (C-2) 재료일 때만 allowance_check 수행
+        if row_type == "material" and d_numeric is not None and e_value is not None:
+            expected = round(d_numeric * multiplier, round_digits)
             diff = abs(expected - e_value)
-
             if diff > tol:
                 errors.append(
                     ErrorRecord(
@@ -467,22 +461,9 @@ def main() -> None:
                         expected_value=expected,
                         difference=diff,
                         tol=tol,
-                        rule_name=str(selected_rule.get("name", "")),
+                        rule_name=rule_name,
                     )
                 )
-
-        # 5) unit_weight
-        for sev, reason, rule_name in unit_weight_check(work, spec, unit):
-            errors.append(
-                ErrorRecord(
-                    row=r,
-                    cell=f"F{r}",
-                    check_type="unit_weight",
-                    reason=reason,
-                    severity=sev,
-                    rule_name=rule_name,
-                )
-            )
 
     try:
         build_reports(errors, args.outdir)
