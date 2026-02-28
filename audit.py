@@ -1,23 +1,12 @@
 #!/usr/bin/env python3
-"""조경 시설물 수량산출서 자동검토 도구 - 실무 안정 최종본
+"""조경 시설물 수량산출서 자동검토 도구 - 실무 안정 최종본 (열 자동탐지 복구)
 
-핵심
+핵심 정책
 - tol 최소 0.01
-- 비고(BIGO)에 % 있을 때만 할증 검토
-- 설치품 공종명(고정 리스트)에 해당하면 할증 검증(allowance_check) 제외
+- 할증 검토는 "비고(BIGO)에 %가 있는 행"에서만 수행
+- 설치품(공종명 리스트)은 할증 검증(allowance_check) 제외
 - D에 이미 *1.04 같은 계수가 있으면 이중할증 방지
 - report.csv / report.xlsx 생성
-
-검토 항목
-1) calc_text_check (항상):
-   - D(산출근거) 텍스트 수식을 계산하여 E(수량) 값과 비교
-   - E가 ROUND(…,n)이면 n 사용, 없으면 기본 n(기본 3)
-   - tol(허용오차) = max(ROUND기반, 0.01)
-
-2) allowance_check (비고% 있을 때만):
-   - 설치품이면 스킵(검증 제외)
-   - 설치품이 아니면 D와 E가 비고%에 맞는지 검증
-   - D에 이미 계수가 있으면 이중할증 방지
 """
 
 from __future__ import annotations
@@ -53,12 +42,10 @@ INSTALLATION_WORK_NAMES = [
 
 
 def is_installation_item(work: str) -> bool:
-    """공종명 기준 설치품 여부(띄어쓰기/특수문자 차이를 조금 흡수)."""
+    """공종명 기준 설치품 여부(띄어쓰기 차이 흡수)."""
     w = (work or "").strip()
     if not w:
         return False
-
-    # 비교용 정규화: 공백 제거
     w_norm = re.sub(r"\s+", "", w)
     for key in INSTALLATION_WORK_NAMES:
         key_norm = re.sub(r"\s+", "", key.strip())
@@ -67,6 +54,9 @@ def is_installation_item(work: str) -> bool:
     return False
 
 
+# ------------------------------
+# 데이터 구조
+# ------------------------------
 @dataclass
 class ErrorRecord:
     row: int
@@ -82,6 +72,9 @@ class ErrorRecord:
     rule_name: str = ""
 
 
+# ------------------------------
+# CLI / Rules
+# ------------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="시설물 수량산출서 자동검토")
     p.add_argument("xlsx", help="입력 XLSX 파일 경로")
@@ -93,12 +86,16 @@ def parse_args() -> argparse.Namespace:
 def load_rules(path: str) -> Dict[str, Any]:
     try:
         import yaml
-    except Exception:
-        return {}
+    except Exception as exc:
+        raise RuntimeError("pyyaml 미설치: `pip install pyyaml` 필요") from exc
+
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
+# ------------------------------
+# 기본 유틸
+# ------------------------------
 def normalize_text(v: Any) -> str:
     return "" if v is None else str(v).strip()
 
@@ -121,6 +118,82 @@ def has_cell_reference(expr: str) -> bool:
 
 
 # ------------------------------
+# 시트/컬럼 자동 탐지
+# ------------------------------
+def choose_sheet_name(wb) -> str:
+    # 우선순위: "시설물산출" 정확히 있으면 사용
+    if "시설물산출" in wb.sheetnames:
+        return "시설물산출"
+
+    # 아니면 점수 기반
+    scored: List[Tuple[int, str]] = []
+    for name in wb.sheetnames:
+        score = 0
+        if "시설물" in name:
+            score += 2
+        if "산출" in name:
+            score += 2
+        if "수량" in name:
+            score += 1
+        if score > 0:
+            scored.append((score, name))
+
+    if scored:
+        scored.sort(reverse=True)
+        return scored[0][1]
+
+    # fallback
+    return wb.sheetnames[0]
+
+
+def detect_columns(ws) -> Tuple[int, Dict[str, int]]:
+    """헤더에서 열 자동 탐지, 실패 시 기본 B~G 사용."""
+    columns = {
+        "work": 2,   # B
+        "spec": 3,   # C
+        "basis": 4,  # D
+        "qty": 5,    # E
+        "unit": 6,   # F
+        "bigo": 7,   # G
+    }
+    header_row = 1
+
+    for r in range(1, min(ws.max_row, 30) + 1):
+        row_values = [
+            normalize_text(ws.cell(r, c).value)
+            for c in range(1, min(ws.max_column, 60) + 1)
+        ]
+        hit = 0
+        for idx, text in enumerate(row_values, start=1):
+            low = text.lower()
+            if "공종" in text:
+                columns["work"] = idx
+                hit += 1
+            if "규격" in text:
+                columns["spec"] = idx
+                hit += 1
+            if "산출근거" in text:
+                columns["basis"] = idx
+                hit += 1
+            if "수량" in text:
+                columns["qty"] = idx
+                hit += 1
+            if "단위" in text:
+                columns["unit"] = idx
+                hit += 1
+            if "비고" in text or "remark" in low:
+                columns["bigo"] = idx
+                hit += 1
+
+        # 2개 이상 맞으면 헤더로 간주 (기존 로직 유지)
+        if hit >= 2:
+            header_row = r
+            break
+
+    return header_row, columns
+
+
+# ------------------------------
 # ROUND / 허용오차
 # ------------------------------
 def parse_round_digits(formula: str) -> Optional[int]:
@@ -136,7 +209,7 @@ def get_round_digits(e_formula: str, default_digits: int = 3) -> int:
 
 
 def tol_from_round_digits(round_digits: int) -> float:
-    # 최소 0.01 허용
+    # 최소 0.01 허용(요청)
     if round_digits <= 0:
         base_tol = 1.0
     else:
@@ -263,8 +336,11 @@ def main() -> None:
     wb_formula = load_workbook(args.xlsx, data_only=False)
     wb_value = load_workbook(args.xlsx, data_only=True)
 
-    ws_formula = wb_formula.active
-    ws_value = wb_value.active
+    sheet_name = choose_sheet_name(wb_formula)
+    ws_formula = wb_formula[sheet_name]
+    ws_value = wb_value[sheet_name]
+
+    header_row, cols = detect_columns(ws_formula)
 
     percent_regex = re.compile(rules.get("allowance_percent_extract_regex", r"(\d+(\.\d+)?)%"))
     allowance_map = rules.get("allowance_multiplier_map", {})
@@ -272,14 +348,15 @@ def main() -> None:
 
     errors: List[ErrorRecord] = []
 
-    for r in range(2, ws_formula.max_row + 1):
-        work = normalize_text(ws_formula[f"B{r}"].value)
-        spec = normalize_text(ws_formula[f"C{r}"].value)
-        d_text = normalize_text(ws_formula[f"D{r}"].value)
-        e_formula = normalize_text(ws_formula[f"E{r}"].value)
-        e_value = as_float(ws_value[f"E{r}"].value)
-        unit = normalize_text(ws_formula[f"F{r}"].value)
-        bigo = normalize_text(ws_formula[f"G{r}"].value)
+    # 헤더 다음 행부터
+    for r in range(header_row + 1, ws_formula.max_row + 1):
+        work = normalize_text(ws_formula.cell(r, cols["work"]).value)
+        spec = normalize_text(ws_formula.cell(r, cols["spec"]).value)
+        d_text = normalize_text(ws_formula.cell(r, cols["basis"]).value)
+        e_formula = normalize_text(ws_formula.cell(r, cols["qty"]).value)
+        e_value = as_float(ws_value.cell(r, cols["qty"]).value)
+        unit = normalize_text(ws_formula.cell(r, cols["unit"]).value)
+        bigo = normalize_text(ws_formula.cell(r, cols["bigo"]).value)
 
         if not any([work, spec, d_text, e_formula, unit, bigo]):
             continue
@@ -315,16 +392,16 @@ def main() -> None:
         # -------------------------
         m = percent_regex.search(bigo)
         if not m:
-            continue  # 할증 검토만 스킵
+            continue
 
-        # 설치품이면 할증검증 제외(요청사항)
+        # 설치품이면 할증 검증 제외
         if is_installation_item(work):
             continue
 
         percent_text = f"{m.group(1)}%"
         if percent_text not in allowance_map:
             errors.append(ErrorRecord(
-                row=r, cell=f"G{r}",
+                row=r, cell=f"{ws_formula.cell(r, cols['bigo']).coordinate}",
                 check_type="allowance_check",
                 reason=f"비고에 '{percent_text}'가 있으나 allowance_multiplier_map에 정의되지 않음",
                 severity="MEDIUM",
@@ -339,7 +416,7 @@ def main() -> None:
         if d_numeric is None or e_value is None:
             continue
 
-        # D에 이미 *1.04 포함이면 이중할증 금지: expected=D 자체
+        # D에 이미 계수가 있으면 이중할증 금지
         if d_has_multiplier(d_text, multiplier):
             expected_allow = round(d_numeric, round_digits)
             rule2 = f"비고 {percent_text} | D already has multiplier"
@@ -350,7 +427,7 @@ def main() -> None:
         diff2 = abs(expected_allow - e_value)
         if diff2 > tol:
             errors.append(ErrorRecord(
-                row=r, cell=f"E{r}",
+                row=r, cell=f"{ws_formula.cell(r, cols['qty']).coordinate}",
                 check_type="allowance_check",
                 reason=f"비고 할증 적용값과 E 수량 불일치(ROUND {round_digits})",
                 severity="MEDIUM",
@@ -361,6 +438,7 @@ def main() -> None:
             ))
 
     csv_path, xlsx_path = build_reports(errors, args.outdir)
+    print(f"[OK] sheet='{sheet_name}', header_row={header_row}, rows_checked={ws_formula.max_row - header_row}")
     print(f"[완료] 오류 건수: {len(errors)}")
     print(f"[OK] report saved: {csv_path} / {xlsx_path}")
 
