@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""조경 시설물 수량산출서 자동검토 도구 (실무 안정 버전 A)
+"""조경 시설물 수량산출서 자동검토 도구 (오탐 저감 버전)
 
-정책
+핵심 정책
 - 할증 관련 검토(allowance_policy_check / allowance_check)는 "비고(BIGO)에 %가 있는 행"에서만 수행한다.
 - calc_text_check / unit_weight는 비고% 유무와 무관하게 항상 수행한다.
 
-실무 안정 포인트
-- tol(허용오차)을 넉넉하게 설정해 단계별 ROUND/엑셀 캐시/부동소수 오차로 인한 오탐을 크게 줄인다.
-  (ROUND(3) 기준 tol=0.002 권장)
+오탐을 줄이기 위한 핵심 개선
+1) E 수식이 =ROUND(셀*계수, n) 형태면, 참조셀의 "값(data_only)"을 가져와 엑셀 방식대로 expected를 계산한다.
+   (단계별 ROUND 때문에 0.001 차이가 나는 케이스를 정상 처리)
+2) allowance_check에서 D 산출근거에 이미 *1.04 같은 할증계수가 포함되어 있으면 "또 곱하지 않음".
 """
 
 from __future__ import annotations
@@ -186,14 +187,9 @@ def get_round_digits_for_row(e_formula: str, default_digits: int) -> int:
 
 
 def tol_from_round_digits(round_digits: int) -> float:
-    """
-    ✅ 실무 안정형 tol
-    - ROUND(3) 기준: 0.002 (0.001 수준 중간ROUND 차이 오탐 제거)
-    - ROUND(2): 0.02 / ROUND(1): 0.2 / ROUND(0 이하): 1.0
-    """
-    if round_digits <= 0:
-        return 1.0
-    return 2.0 * (10 ** (-round_digits))
+    # 3자리 반올림이면 0.0005가 이론상 최대오차.
+    # float/엑셀 차이 흡수 위해 약간 넉넉히 0.0006.
+    return 0.6 * (10 ** (-round_digits))
 
 
 def classify_row_type(work: str, spec: str, unit: str, bigo: str, rules: Dict[str, Any]) -> str:
@@ -283,6 +279,7 @@ def eval_e_round_pure_formula(e_formula: str) -> Optional[Tuple[float, int]]:
     inner = m.group(1).strip()
     digits = int(m.group(2))
 
+    # inner에 셀참조가 있으면 여기서 계산하지 않음
     if has_cell_reference(inner):
         return None
 
@@ -294,9 +291,13 @@ def eval_e_round_pure_formula(e_formula: str) -> Optional[Tuple[float, int]]:
 
 
 def d_has_multiplier(d_text: str, mult: float) -> bool:
-    """D 산출근거에 '* 1.04' 같이 계수가 직접 포함되어 있는지 대략 감지."""
+    """
+    D 산출근거에 '* 1.04' 같이 계수가 직접 포함되어 있는지 대략 감지.
+    (이중 할증 방지)
+    """
     if not d_text:
         return False
+    # 곱해지는 숫자들 중 mult에 가까운 값이 있는지 확인
     candidates = re.findall(r"\*\s*([0-9]+(?:\.[0-9]+)?)", d_text.replace(",", ""))
     for s in candidates:
         try:
@@ -423,22 +424,29 @@ def main() -> None:
         if not any([work, spec, d_text, e_formula, unit, bigo]):
             continue
 
+        # 행 유형
         row_type = classify_row_type(work, spec, unit, bigo, rules)
 
+        # ROUND 자리수/허용오차
         round_digits = get_round_digits_for_row(e_formula, default_round_digits)
         tol = tol_from_round_digits(round_digits)
 
-        # (1) calc_text_check
+        # -----------------------------
+        # (1) calc_text_check (항상)
+        # -----------------------------
         expected_from_e: Optional[float] = None
         expected_rule_name = ""
 
+        # 1-A) E가 ROUND(셀*계수,n) 형태면, 참조셀 값 기반으로 expected 계산(단계별 ROUND 대응)
         ref_eval = eval_e_round_ref_formula(e_formula, ws_value)
         if ref_eval is not None:
             expected_from_e, ref_cell, mult_in_e, digits_in_e = ref_eval
+            # E 수식의 digits가 실제 기준
             round_digits = digits_in_e
             tol = tol_from_round_digits(round_digits)
             expected_rule_name = f"E:ROUND({ref_cell}*{mult_in_e},{digits_in_e})"
 
+        # 1-B) E가 ROUND(순수식,n) 형태면 계산
         if expected_from_e is None:
             pure_eval = eval_e_round_pure_formula(e_formula)
             if pure_eval is not None:
@@ -447,6 +455,7 @@ def main() -> None:
                 tol = tol_from_round_digits(round_digits)
                 expected_rule_name = f"E:ROUND(pure_expr,{digits_in_e})"
 
+        # 1-C) 위 2개가 아니면 D(산출근거) 계산값을 ROUND해서 비교(기존 방식)
         d_numeric: Optional[float] = None
         if expected_from_e is None:
             if d_text and not has_cell_reference(d_text):
@@ -474,7 +483,9 @@ def main() -> None:
                     )
                 )
 
-        # (2) unit_weight
+        # -----------------------------
+        # (2) unit_weight (항상)
+        # -----------------------------
         for sev, reason, rule_name in unit_weight_check(work, spec, unit):
             errors.append(
                 ErrorRecord(
@@ -487,10 +498,12 @@ def main() -> None:
                 )
             )
 
+        # -----------------------------
         # (3) 할증 검토 (비고% 있을 때만)
+        # -----------------------------
         m = percent_regex.search(bigo)
         if not m:
-            continue
+            continue  # 할증 관련만 스킵
 
         percent_text = f"{m.group(1)}%"
         if percent_text not in allowance_map:
@@ -510,6 +523,7 @@ def main() -> None:
         multiplier = float(allowance_map[percent_text])
         rule_name = f"비고 퍼센트({percent_text})"
 
+        # 3-A) 설치품인데 비고에 %가 있으면 정책 위반
         if row_type == "installation":
             errors.append(
                 ErrorRecord(
@@ -524,14 +538,15 @@ def main() -> None:
             )
             continue
 
+        # 3-B) 재료에서만 allowance_check 수행
         if row_type == "material" and e_value is not None:
-            # E가 ROUND(셀*계수,n) 형식이면 그 방식으로 검증(단계ROUND 안정)
+            # 3-B-1) E가 ROUND(셀*계수,n)라면 그 계수(수식상 계수)가 비고%와 맞는지 + 결과가 맞는지 검증
             ref_eval2 = eval_e_round_ref_formula(e_formula, ws_value)
             if ref_eval2 is not None:
                 expected_e, ref_cell, mult_in_e, digits_in_e = ref_eval2
                 tol2 = tol_from_round_digits(digits_in_e)
 
-                # 계수 불일치만큼은 실무에서도 의미 있어서 유지
+                # (a) 계수 자체가 비고%와 다르면 잡아줌(원하면 끌 수도 있음)
                 if abs(mult_in_e - multiplier) > 1e-9:
                     errors.append(
                         ErrorRecord(
@@ -549,6 +564,7 @@ def main() -> None:
                         )
                     )
 
+                # (b) 계산 결과 비교
                 diff2 = abs(expected_e - e_value)
                 if diff2 > tol2:
                     errors.append(
@@ -556,7 +572,7 @@ def main() -> None:
                             row=r,
                             cell=f"E{r}",
                             check_type="allowance_check",
-                            reason="재료 항목: E 수식(참조셀 기반) 계산값과 E 수량 불일치",
+                            reason=f"재료 항목: E 수식(참조셀 기반) 계산값과 E 수량 불일치",
                             severity="MEDIUM",
                             related_formula=f"E:{e_formula} | BIGO:{bigo}",
                             actual_value=e_value,
@@ -568,11 +584,12 @@ def main() -> None:
                     )
                 continue
 
-            # E가 참조형이 아니면 D 수식 기반(이중할증 방지)
+            # 3-B-2) E가 참조형이 아니면, D 수식으로 검증(단, D에 이미 계수가 있으면 이중 곱 금지)
             if d_numeric is None and d_text and not has_cell_reference(d_text):
                 d_numeric = safe_eval_numeric(d_text)
 
             if d_numeric is not None:
+                # D에 이미 *1.04 같은 계수가 있으면 expected = D(그 자체)로 비교
                 if d_has_multiplier(d_text, multiplier):
                     expected_allow = round(d_numeric, round_digits)
                     rule2 = f"{rule_name} | D already has {multiplier}"
@@ -588,7 +605,7 @@ def main() -> None:
                             row=r,
                             cell=f"E{r}",
                             check_type="allowance_check",
-                            reason="재료 항목: 비고 할증 적용 기대값과 E 수량 불일치",
+                            reason=f"재료 항목: 비고 할증 적용 기대값과 E 수량 불일치",
                             severity="MEDIUM",
                             related_formula=f"D:{d_text} | E:{e_formula} | BIGO:{bigo}",
                             actual_value=e_value,
