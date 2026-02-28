@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
-"""조경 시설물 수량산출서 자동검토 도구 - 실무 안정 최종본 (열 자동탐지 복구)
+"""조경 시설물 수량산출서 자동검토 도구 - 실무 안정 (할증 2건 현상 원인추적/복구)
 
-핵심 정책
+핵심
 - tol 최소 0.01
-- 할증 검토는 "비고(BIGO)에 %가 있는 행"에서만 수행
-- 설치품(공종명 리스트)은 할증 검증(allowance_check) 제외
+- 비고(BIGO)에 % 있을 때만 할증 검토
+- 설치품 공종명 리스트는 할증 검증(allowance_check) 제외
 - D에 이미 *1.04 같은 계수가 있으면 이중할증 방지
 - report.csv / report.xlsx 생성
+- ✅ 왜 할증 오류가 안 나오는지 '스킵 사유 카운터'를 로그로 출력
 """
 
 from __future__ import annotations
@@ -21,9 +22,6 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 
-# ------------------------------
-# 설치품 공종명(사용자 제공)
-# ------------------------------
 INSTALLATION_WORK_NAMES = [
     "혼합골재포설및다짐",
     "레미콘타설",
@@ -42,7 +40,6 @@ INSTALLATION_WORK_NAMES = [
 
 
 def is_installation_item(work: str) -> bool:
-    """공종명 기준 설치품 여부(띄어쓰기 차이 흡수)."""
     w = (work or "").strip()
     if not w:
         return False
@@ -54,9 +51,6 @@ def is_installation_item(work: str) -> bool:
     return False
 
 
-# ------------------------------
-# 데이터 구조
-# ------------------------------
 @dataclass
 class ErrorRecord:
     row: int
@@ -72,9 +66,6 @@ class ErrorRecord:
     rule_name: str = ""
 
 
-# ------------------------------
-# CLI / Rules
-# ------------------------------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="시설물 수량산출서 자동검토")
     p.add_argument("xlsx", help="입력 XLSX 파일 경로")
@@ -88,14 +79,10 @@ def load_rules(path: str) -> Dict[str, Any]:
         import yaml
     except Exception as exc:
         raise RuntimeError("pyyaml 미설치: `pip install pyyaml` 필요") from exc
-
     with open(path, "r", encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
-# ------------------------------
-# 기본 유틸
-# ------------------------------
 def normalize_text(v: Any) -> str:
     return "" if v is None else str(v).strip()
 
@@ -117,52 +104,53 @@ def has_cell_reference(expr: str) -> bool:
     return bool(re.search(r"\$?[A-Za-z]{1,3}\$?\d+", expr))
 
 
-# ------------------------------
-# 시트/컬럼 자동 탐지
-# ------------------------------
+# --------------------------
+# 시트/헤더 선택 강화
+# --------------------------
+HEADER_KEYWORDS = ["공종", "규격", "산출근거", "수량", "단위", "비고"]
+
+
+def score_sheet(ws) -> int:
+    """시트 내 상단에서 헤더 키워드가 얼마나 보이는지로 점수화."""
+    max_r = min(ws.max_row, 40)
+    max_c = min(ws.max_column, 60)
+    score = 0
+    for r in range(1, max_r + 1):
+        row_text = " ".join(normalize_text(ws.cell(r, c).value) for c in range(1, max_c + 1))
+        for k in HEADER_KEYWORDS:
+            if k in row_text:
+                score += 2
+        # '산출근거/수량'은 특히 중요
+        if "산출근거" in row_text:
+            score += 5
+        if "수량" in row_text:
+            score += 5
+    return score
+
+
 def choose_sheet_name(wb) -> str:
-    # 우선순위: "시설물산출" 정확히 있으면 사용
-    if "시설물산출" in wb.sheetnames:
-        return "시설물산출"
-
-    # 아니면 점수 기반
-    scored: List[Tuple[int, str]] = []
+    # 1) 점수 가장 높은 시트 선택
+    best = None
+    best_score = -1
     for name in wb.sheetnames:
-        score = 0
-        if "시설물" in name:
-            score += 2
-        if "산출" in name:
-            score += 2
-        if "수량" in name:
-            score += 1
-        if score > 0:
-            scored.append((score, name))
-
-    if scored:
-        scored.sort(reverse=True)
-        return scored[0][1]
-
-    # fallback
-    return wb.sheetnames[0]
+        ws = wb[name]
+        s = score_sheet(ws)
+        if s > best_score:
+            best_score = s
+            best = name
+    return best or wb.sheetnames[0]
 
 
 def detect_columns(ws) -> Tuple[int, Dict[str, int]]:
-    """헤더에서 열 자동 탐지, 실패 시 기본 B~G 사용."""
-    columns = {
-        "work": 2,   # B
-        "spec": 3,   # C
-        "basis": 4,  # D
-        "qty": 5,    # E
-        "unit": 6,   # F
-        "bigo": 7,   # G
-    }
+    """
+    헤더에서 열 자동 탐지.
+    ✅ hit 기준을 4로 올려서(공종/규격/산출근거/수량 등) 엉뚱한 행을 헤더로 잡는 오탐을 줄임.
+    """
+    columns = {"work": 2, "spec": 3, "basis": 4, "qty": 5, "unit": 6, "bigo": 7}
     header_row = 1
 
-    for r in range(1, min(ws.max_row, 30) + 1):
-        row_values = [
-            normalize_text(ws.cell(r, c).value)
-            for c in range(1, min(ws.max_column, 60) + 1)
-        ]
+    for r in range(1, min(ws.max_row, 40) + 1):
+        row_values = [normalize_text(ws.cell(r, c).value) for c in range(1, min(ws.max_column, 60) + 1)]
         hit = 0
         for idx, text in enumerate(row_values, start=1):
             low = text.lower()
@@ -184,18 +172,16 @@ def detect_columns(ws) -> Tuple[int, Dict[str, int]]:
             if "비고" in text or "remark" in low:
                 columns["bigo"] = idx
                 hit += 1
-
-        # 2개 이상 맞으면 헤더로 간주 (기존 로직 유지)
-        if hit >= 2:
+        if hit >= 4:
             header_row = r
             break
 
     return header_row, columns
 
 
-# ------------------------------
-# ROUND / 허용오차
-# ------------------------------
+# --------------------------
+# ROUND / tol
+# --------------------------
 def parse_round_digits(formula: str) -> Optional[int]:
     if not formula:
         return None
@@ -209,7 +195,6 @@ def get_round_digits(e_formula: str, default_digits: int = 3) -> int:
 
 
 def tol_from_round_digits(round_digits: int) -> float:
-    # 최소 0.01 허용(요청)
     if round_digits <= 0:
         base_tol = 1.0
     else:
@@ -217,11 +202,10 @@ def tol_from_round_digits(round_digits: int) -> float:
     return max(base_tol, 0.01)
 
 
-# ------------------------------
+# --------------------------
 # 수식 계산
-# ------------------------------
+# --------------------------
 def safe_eval_numeric(expr: str) -> Optional[float]:
-    """숫자/연산자/괄호만 허용해 계산(셀참조/문자 포함 시 None)."""
     expr = expr.strip()
     if expr.startswith("="):
         expr = expr[1:].strip()
@@ -253,7 +237,6 @@ def safe_eval_numeric(expr: str) -> Optional[float]:
 
 
 def d_has_multiplier(d_text: str, mult: float) -> bool:
-    """D 산출근거에 '* 1.04' 같이 계수가 직접 포함되어 있는지 감지(이중 할증 방지)."""
     if not d_text:
         return False
     nums = re.findall(r"\*\s*([0-9]+(?:\.[0-9]+)?)", d_text.replace(",", ""))
@@ -266,9 +249,9 @@ def d_has_multiplier(d_text: str, mult: float) -> bool:
     return False
 
 
-# ------------------------------
-# 리포트 생성
-# ------------------------------
+# --------------------------
+# report
+# --------------------------
 def build_reports(errors: List[ErrorRecord], outdir: str) -> Tuple[str, str]:
     from openpyxl import Workbook
 
@@ -277,20 +260,10 @@ def build_reports(errors: List[ErrorRecord], outdir: str) -> Tuple[str, str]:
     xlsx_path = os.path.join(outdir, "report.xlsx")
 
     columns = [
-        "row",
-        "cell",
-        "check_type",
-        "reason",
-        "severity",
-        "rule_name",
-        "related_formula",
-        "actual_value",
-        "expected_value",
-        "difference",
-        "tol",
+        "row", "cell", "check_type", "reason", "severity", "rule_name",
+        "related_formula", "actual_value", "expected_value", "difference", "tol",
     ]
 
-    # CSV
     with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
         w = csv.writer(f)
         w.writerow(columns)
@@ -300,7 +273,6 @@ def build_reports(errors: List[ErrorRecord], outdir: str) -> Tuple[str, str]:
                 e.related_formula, e.actual_value, e.expected_value, e.difference, e.tol
             ])
 
-    # XLSX
     wb = Workbook()
     ws_sum = wb.active
     ws_sum.title = "Summary"
@@ -324,9 +296,6 @@ def build_reports(errors: List[ErrorRecord], outdir: str) -> Tuple[str, str]:
     return csv_path, xlsx_path
 
 
-# ------------------------------
-# 메인
-# ------------------------------
 def main() -> None:
     args = parse_args()
     rules = load_rules(args.rules)
@@ -348,7 +317,14 @@ def main() -> None:
 
     errors: List[ErrorRecord] = []
 
-    # 헤더 다음 행부터
+    # ✅ 원인 추적 카운터
+    rows_total = 0
+    rows_with_percent = 0
+    skipped_installation = 0
+    skipped_no_e_value = 0
+    skipped_no_d_numeric = 0
+    skipped_no_map = 0
+
     for r in range(header_row + 1, ws_formula.max_row + 1):
         work = normalize_text(ws_formula.cell(r, cols["work"]).value)
         spec = normalize_text(ws_formula.cell(r, cols["spec"]).value)
@@ -361,12 +337,12 @@ def main() -> None:
         if not any([work, spec, d_text, e_formula, unit, bigo]):
             continue
 
+        rows_total += 1
+
         round_digits = get_round_digits(e_formula, default_digits=default_round_digits)
         tol = tol_from_round_digits(round_digits)
 
-        # -------------------------
-        # 1) calc_text_check (항상)
-        # -------------------------
+        # calc_text_check
         d_numeric: Optional[float] = None
         if d_text and not has_cell_reference(d_text):
             d_numeric = safe_eval_numeric(d_text)
@@ -376,7 +352,7 @@ def main() -> None:
             diff = abs(expected - e_value)
             if diff > tol:
                 errors.append(ErrorRecord(
-                    row=r, cell=f"D{r}/E{r}",
+                    row=r, cell=f"{ws_formula.cell(r, cols['basis']).coordinate}/{ws_formula.cell(r, cols['qty']).coordinate}",
                     check_type="calc_text_check",
                     reason=f"D 계산값과 E 수량 불일치(ROUND {round_digits})",
                     severity="HIGH",
@@ -386,37 +362,41 @@ def main() -> None:
                     rule_name=f"ROUND({round_digits})",
                 ))
 
-        # -------------------------
-        # 2) allowance_check (비고% 있을 때만)
-        #    ✅ 설치품이면 할증 검증 제외
-        # -------------------------
+        # allowance: 비고% 있을 때만
         m = percent_regex.search(bigo)
         if not m:
             continue
 
-        # 설치품이면 할증 검증 제외
+        rows_with_percent += 1
+
+        # 설치품은 할증 검증 제외
         if is_installation_item(work):
+            skipped_installation += 1
             continue
 
         percent_text = f"{m.group(1)}%"
         if percent_text not in allowance_map:
+            skipped_no_map += 1
             errors.append(ErrorRecord(
                 row=r, cell=f"{ws_formula.cell(r, cols['bigo']).coordinate}",
                 check_type="allowance_check",
-                reason=f"비고에 '{percent_text}'가 있으나 allowance_multiplier_map에 정의되지 않음",
+                reason=f"비고 '{percent_text}'가 allowance_multiplier_map에 없음",
                 severity="MEDIUM",
                 related_formula=f"BIGO:{bigo}",
                 rule_name="allowance_multiplier_map missing",
             ))
             continue
 
-        multiplier = float(allowance_map[percent_text])
-
-        # D 계산이 가능해야 검증 가능(셀참조 있으면 skip)
-        if d_numeric is None or e_value is None:
+        if e_value is None:
+            skipped_no_e_value += 1
             continue
 
-        # D에 이미 계수가 있으면 이중할증 금지
+        if d_numeric is None:
+            skipped_no_d_numeric += 1
+            continue
+
+        multiplier = float(allowance_map[percent_text])
+
         if d_has_multiplier(d_text, multiplier):
             expected_allow = round(d_numeric, round_digits)
             rule2 = f"비고 {percent_text} | D already has multiplier"
@@ -438,7 +418,10 @@ def main() -> None:
             ))
 
     csv_path, xlsx_path = build_reports(errors, args.outdir)
-    print(f"[OK] sheet='{sheet_name}', header_row={header_row}, rows_checked={ws_formula.max_row - header_row}")
+
+    print(f"[OK] sheet='{sheet_name}', header_row={header_row}, rows_checked={rows_total}")
+    print(f"[OK] with_percent={rows_with_percent}, skipped_installation={skipped_installation}, skipped_no_map={skipped_no_map}")
+    print(f"[OK] skipped_no_e_value={skipped_no_e_value}, skipped_no_d_numeric={skipped_no_d_numeric}")
     print(f"[완료] 오류 건수: {len(errors)}")
     print(f"[OK] report saved: {csv_path} / {xlsx_path}")
 
