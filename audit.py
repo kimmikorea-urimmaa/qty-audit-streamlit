@@ -3,9 +3,21 @@
 
 핵심
 - tol 최소 0.01
-- 비고에 % 있을 때만 할증 검토
-- D에 이미 *1.04가 있으면 이중할증 방지
+- 비고(BIGO)에 % 있을 때만 할증 검토
+- 설치품 공종명(고정 리스트)에 해당하면 할증 검증(allowance_check) 제외
+- D에 이미 *1.04 같은 계수가 있으면 이중할증 방지
 - report.csv / report.xlsx 생성
+
+검토 항목
+1) calc_text_check (항상):
+   - D(산출근거) 텍스트 수식을 계산하여 E(수량) 값과 비교
+   - E가 ROUND(…,n)이면 n 사용, 없으면 기본 n(기본 3)
+   - tol(허용오차) = max(ROUND기반, 0.01)
+
+2) allowance_check (비고% 있을 때만):
+   - 설치품이면 스킵(검증 제외)
+   - 설치품이 아니면 D와 E가 비고%에 맞는지 검증
+   - D에 이미 계수가 있으면 이중할증 방지
 """
 
 from __future__ import annotations
@@ -18,6 +30,41 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
+
+
+# ------------------------------
+# 설치품 공종명(사용자 제공)
+# ------------------------------
+INSTALLATION_WORK_NAMES = [
+    "혼합골재포설및다짐",
+    "레미콘타설",
+    "통석놓기",
+    "철근가공조립",
+    "잡철물제작및설치",
+    "목재가공 및 설치",
+    "목재가공및설치",
+    "플랜터 설치",
+    "플랜터설치",
+    "우레탄도장",
+    "석재판석붙임",
+    "친환경스테인도장",
+    "데크깔기",
+]
+
+
+def is_installation_item(work: str) -> bool:
+    """공종명 기준 설치품 여부(띄어쓰기/특수문자 차이를 조금 흡수)."""
+    w = (work or "").strip()
+    if not w:
+        return False
+
+    # 비교용 정규화: 공백 제거
+    w_norm = re.sub(r"\s+", "", w)
+    for key in INSTALLATION_WORK_NAMES:
+        key_norm = re.sub(r"\s+", "", key.strip())
+        if key_norm and key_norm in w_norm:
+            return True
+    return False
 
 
 @dataclass
@@ -73,6 +120,9 @@ def has_cell_reference(expr: str) -> bool:
     return bool(re.search(r"\$?[A-Za-z]{1,3}\$?\d+", expr))
 
 
+# ------------------------------
+# ROUND / 허용오차
+# ------------------------------
 def parse_round_digits(formula: str) -> Optional[int]:
     if not formula:
         return None
@@ -94,7 +144,11 @@ def tol_from_round_digits(round_digits: int) -> float:
     return max(base_tol, 0.01)
 
 
+# ------------------------------
+# 수식 계산
+# ------------------------------
 def safe_eval_numeric(expr: str) -> Optional[float]:
+    """숫자/연산자/괄호만 허용해 계산(셀참조/문자 포함 시 None)."""
     expr = expr.strip()
     if expr.startswith("="):
         expr = expr[1:].strip()
@@ -111,6 +165,8 @@ def safe_eval_numeric(expr: str) -> Optional[float]:
         ast.Pow,
         ast.USub,
         ast.UAdd,
+        ast.Mod,
+        ast.FloorDiv,
     )
 
     try:
@@ -124,6 +180,7 @@ def safe_eval_numeric(expr: str) -> Optional[float]:
 
 
 def d_has_multiplier(d_text: str, mult: float) -> bool:
+    """D 산출근거에 '* 1.04' 같이 계수가 직접 포함되어 있는지 감지(이중 할증 방지)."""
     if not d_text:
         return False
     nums = re.findall(r"\*\s*([0-9]+(?:\.[0-9]+)?)", d_text.replace(",", ""))
@@ -136,18 +193,9 @@ def d_has_multiplier(d_text: str, mult: float) -> bool:
     return False
 
 
-def classify_row_type(work: str, spec: str, unit: str, bigo: str, rules: Dict[str, Any]) -> str:
-    text = f"{work} {spec} {unit} {bigo}".lower()
-    material_keys = [str(x).lower() for x in (rules.get("material_keywords_any") or [])]
-    install_keys = [str(x).lower() for x in (rules.get("installation_keywords_any") or [])]
-
-    if material_keys and any(k in text for k in material_keys):
-        return "material"
-    if install_keys and any(k in text for k in install_keys):
-        return "installation"
-    return "unknown"
-
-
+# ------------------------------
+# 리포트 생성
+# ------------------------------
 def build_reports(errors: List[ErrorRecord], outdir: str) -> Tuple[str, str]:
     from openpyxl import Workbook
 
@@ -203,6 +251,9 @@ def build_reports(errors: List[ErrorRecord], outdir: str) -> Tuple[str, str]:
     return csv_path, xlsx_path
 
 
+# ------------------------------
+# 메인
+# ------------------------------
 def main() -> None:
     args = parse_args()
     rules = load_rules(args.rules)
@@ -215,8 +266,9 @@ def main() -> None:
     ws_formula = wb_formula.active
     ws_value = wb_value.active
 
-    percent_regex = re.compile(r"(\d+(\.\d+)?)%")
+    percent_regex = re.compile(rules.get("allowance_percent_extract_regex", r"(\d+(\.\d+)?)%"))
     allowance_map = rules.get("allowance_multiplier_map", {})
+    default_round_digits = int(rules.get("round_default_digits", 3))
 
     errors: List[ErrorRecord] = []
 
@@ -232,74 +284,81 @@ def main() -> None:
         if not any([work, spec, d_text, e_formula, unit, bigo]):
             continue
 
-        round_digits = get_round_digits(e_formula)
+        round_digits = get_round_digits(e_formula, default_digits=default_round_digits)
         tol = tol_from_round_digits(round_digits)
 
-        # calc_text_check
+        # -------------------------
+        # 1) calc_text_check (항상)
+        # -------------------------
+        d_numeric: Optional[float] = None
         if d_text and not has_cell_reference(d_text):
             d_numeric = safe_eval_numeric(d_text)
-            if d_numeric is not None and e_value is not None:
-                expected = round(d_numeric, round_digits)
-                diff = abs(expected - e_value)
-                if diff > tol:
-                    errors.append(ErrorRecord(
-                        row=r, cell=f"D{r}/E{r}",
-                        check_type="calc_text_check",
-                        reason="D 계산값과 E 수량 불일치",
-                        severity="HIGH",
-                        related_formula=f"D:{d_text} | E:{e_formula} | BIGO:{bigo}",
-                        actual_value=e_value, expected_value=expected,
-                        difference=diff, tol=tol,
-                        rule_name=f"ROUND({round_digits})"
-                    ))
 
-        # allowance: 비고% 있을 때만
+        if d_numeric is not None and e_value is not None:
+            expected = round(d_numeric, round_digits)
+            diff = abs(expected - e_value)
+            if diff > tol:
+                errors.append(ErrorRecord(
+                    row=r, cell=f"D{r}/E{r}",
+                    check_type="calc_text_check",
+                    reason=f"D 계산값과 E 수량 불일치(ROUND {round_digits})",
+                    severity="HIGH",
+                    related_formula=f"D:{d_text} | E:{e_formula} | BIGO:{bigo}",
+                    actual_value=e_value, expected_value=expected,
+                    difference=diff, tol=tol,
+                    rule_name=f"ROUND({round_digits})",
+                ))
+
+        # -------------------------
+        # 2) allowance_check (비고% 있을 때만)
+        #    ✅ 설치품이면 할증 검증 제외
+        # -------------------------
         m = percent_regex.search(bigo)
         if not m:
+            continue  # 할증 검토만 스킵
+
+        # 설치품이면 할증검증 제외(요청사항)
+        if is_installation_item(work):
             continue
 
         percent_text = f"{m.group(1)}%"
         if percent_text not in allowance_map:
-            continue
-
-        multiplier = float(allowance_map[percent_text])
-        row_type = classify_row_type(work, spec, unit, bigo, rules)
-
-        if row_type == "installation":
             errors.append(ErrorRecord(
-                row=r, cell=f"E{r}",
-                check_type="allowance_policy_check",
-                reason="설치품에 할증% 명시됨(정책 위반)",
-                severity="HIGH",
-                related_formula=f"D:{d_text} | E:{e_formula} | BIGO:{bigo}",
-                rule_name=f"비고 {percent_text}"
+                row=r, cell=f"G{r}",
+                check_type="allowance_check",
+                reason=f"비고에 '{percent_text}'가 있으나 allowance_multiplier_map에 정의되지 않음",
+                severity="MEDIUM",
+                related_formula=f"BIGO:{bigo}",
+                rule_name="allowance_multiplier_map missing",
             ))
             continue
 
-        if row_type == "material":
-            d_numeric = safe_eval_numeric(d_text) if (d_text and not has_cell_reference(d_text)) else None
-            if d_numeric is None or e_value is None:
-                continue
+        multiplier = float(allowance_map[percent_text])
 
-            if d_has_multiplier(d_text, multiplier):
-                expected = round(d_numeric, round_digits)
-                rule2 = "D already has multiplier"
-            else:
-                expected = round(d_numeric * multiplier, round_digits)
-                rule2 = "D * multiplier"
+        # D 계산이 가능해야 검증 가능(셀참조 있으면 skip)
+        if d_numeric is None or e_value is None:
+            continue
 
-            diff = abs(expected - e_value)
-            if diff > tol:
-                errors.append(ErrorRecord(
-                    row=r, cell=f"E{r}",
-                    check_type="allowance_check",
-                    reason="비고 할증 적용값과 E 수량 불일치",
-                    severity="MEDIUM",
-                    related_formula=f"D:{d_text} | E:{e_formula} | BIGO:{bigo}",
-                    actual_value=e_value, expected_value=expected,
-                    difference=diff, tol=tol,
-                    rule_name=f"비고 {percent_text} | {rule2}"
-                ))
+        # D에 이미 *1.04 포함이면 이중할증 금지: expected=D 자체
+        if d_has_multiplier(d_text, multiplier):
+            expected_allow = round(d_numeric, round_digits)
+            rule2 = f"비고 {percent_text} | D already has multiplier"
+        else:
+            expected_allow = round(d_numeric * multiplier, round_digits)
+            rule2 = f"비고 {percent_text} | D * multiplier"
+
+        diff2 = abs(expected_allow - e_value)
+        if diff2 > tol:
+            errors.append(ErrorRecord(
+                row=r, cell=f"E{r}",
+                check_type="allowance_check",
+                reason=f"비고 할증 적용값과 E 수량 불일치(ROUND {round_digits})",
+                severity="MEDIUM",
+                related_formula=f"D:{d_text} | E:{e_formula} | BIGO:{bigo}",
+                actual_value=e_value, expected_value=expected_allow,
+                difference=diff2, tol=tol,
+                rule_name=rule2,
+            ))
 
     csv_path, xlsx_path = build_reports(errors, args.outdir)
     print(f"[완료] 오류 건수: {len(errors)}")
