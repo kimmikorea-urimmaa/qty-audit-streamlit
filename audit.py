@@ -206,7 +206,18 @@ def get_round_digits_for_row(e_formula: str, default_digits: int = 3) -> int:
 
 
 def tol_from_round_digits(round_digits: int) -> float:
-    return 0.6 * (10 ** (-round_digits))
+    """
+    실무 기준:
+    - 기본 ROUND 허용오차
+    - 단, 최소 허용오차는 0.01
+    """
+    if round_digits <= 0:
+        base_tol = 1.0
+    else:
+        base_tol = 2.0 * (10 ** (-round_digits))
+
+    # 🔥 핵심: 최소 허용오차 0.01 보장
+    return max(base_tol, 0.01)
 
 
 def classify_row_type(work: str, spec: str, unit: str, bigo: str, rules: Dict[str, Any]) -> str:
