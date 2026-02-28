@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""조경 시설물 수량산출서 자동검토 도구 - 실무 안정 최종본"""
+"""조경 시설물 수량산출서 자동검토 도구 - 실무 안정 최종본
+
+핵심
+- tol 최소 0.01
+- 비고에 % 있을 때만 할증 검토
+- D에 이미 *1.04가 있으면 이중할증 방지
+- report.csv / report.xlsx 생성
+"""
 
 from __future__ import annotations
 
@@ -12,10 +19,6 @@ import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-
-# ==============================
-# 데이터 구조
-# ==============================
 
 @dataclass
 class ErrorRecord:
@@ -31,10 +34,6 @@ class ErrorRecord:
     tol: Optional[float] = None
     rule_name: str = ""
 
-
-# ==============================
-# 기본 유틸
-# ==============================
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="시설물 수량산출서 자동검토")
@@ -74,10 +73,6 @@ def has_cell_reference(expr: str) -> bool:
     return bool(re.search(r"\$?[A-Za-z]{1,3}\$?\d+", expr))
 
 
-# ==============================
-# ROUND / 허용오차
-# ==============================
-
 def parse_round_digits(formula: str) -> Optional[int]:
     if not formula:
         return None
@@ -91,20 +86,13 @@ def get_round_digits(e_formula: str, default_digits: int = 3) -> int:
 
 
 def tol_from_round_digits(round_digits: int) -> float:
-    """
-    실무 기준:
-    - 최소 허용오차 0.01
-    """
+    # 최소 0.01 허용
     if round_digits <= 0:
         base_tol = 1.0
     else:
         base_tol = 2.0 * (10 ** (-round_digits))
     return max(base_tol, 0.01)
 
-
-# ==============================
-# 수식 계산
-# ==============================
 
 def safe_eval_numeric(expr: str) -> Optional[float]:
     expr = expr.strip()
@@ -136,7 +124,6 @@ def safe_eval_numeric(expr: str) -> Optional[float]:
 
 
 def d_has_multiplier(d_text: str, mult: float) -> bool:
-    """D에 이미 *1.04 같은 계수 포함 여부 검사"""
     if not d_text:
         return False
     nums = re.findall(r"\*\s*([0-9]+(?:\.[0-9]+)?)", d_text.replace(",", ""))
@@ -148,10 +135,6 @@ def d_has_multiplier(d_text: str, mult: float) -> bool:
             pass
     return False
 
-
-# ==============================
-# 행 분류
-# ==============================
 
 def classify_row_type(work: str, spec: str, unit: str, bigo: str, rules: Dict[str, Any]) -> str:
     text = f"{work} {spec} {unit} {bigo}".lower()
@@ -165,11 +148,62 @@ def classify_row_type(work: str, spec: str, unit: str, bigo: str, rules: Dict[st
     return "unknown"
 
 
-# ==============================
-# 메인
-# ==============================
+def build_reports(errors: List[ErrorRecord], outdir: str) -> Tuple[str, str]:
+    from openpyxl import Workbook
 
-def main():
+    os.makedirs(outdir, exist_ok=True)
+    csv_path = os.path.join(outdir, "report.csv")
+    xlsx_path = os.path.join(outdir, "report.xlsx")
+
+    columns = [
+        "row",
+        "cell",
+        "check_type",
+        "reason",
+        "severity",
+        "rule_name",
+        "related_formula",
+        "actual_value",
+        "expected_value",
+        "difference",
+        "tol",
+    ]
+
+    # CSV
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(columns)
+        for e in errors:
+            w.writerow([
+                e.row, e.cell, e.check_type, e.reason, e.severity, e.rule_name,
+                e.related_formula, e.actual_value, e.expected_value, e.difference, e.tol
+            ])
+
+    # XLSX
+    wb = Workbook()
+    ws_sum = wb.active
+    ws_sum.title = "Summary"
+    ws_sum.append(["check_type", "severity", "count"])
+
+    summary: Dict[Tuple[str, str], int] = {}
+    for e in errors:
+        summary[(e.check_type, e.severity)] = summary.get((e.check_type, e.severity), 0) + 1
+    for (ct, sev), cnt in sorted(summary.items(), key=lambda x: (x[0][0], x[0][1])):
+        ws_sum.append([ct, sev, cnt])
+
+    ws_err = wb.create_sheet("Errors")
+    ws_err.append(columns)
+    for e in errors:
+        ws_err.append([
+            e.row, e.cell, e.check_type, e.reason, e.severity, e.rule_name,
+            e.related_formula, e.actual_value, e.expected_value, e.difference, e.tol
+        ])
+
+    wb.save(xlsx_path)
+    return csv_path, xlsx_path
+
+
+def main() -> None:
     args = parse_args()
     rules = load_rules(args.rules)
 
@@ -201,9 +235,7 @@ def main():
         round_digits = get_round_digits(e_formula)
         tol = tol_from_round_digits(round_digits)
 
-        # -------------------------
         # calc_text_check
-        # -------------------------
         if d_text and not has_cell_reference(d_text):
             d_numeric = safe_eval_numeric(d_text)
             if d_numeric is not None and e_value is not None:
@@ -211,21 +243,17 @@ def main():
                 diff = abs(expected - e_value)
                 if diff > tol:
                     errors.append(ErrorRecord(
-                        row=r,
-                        cell=f"D{r}/E{r}",
+                        row=r, cell=f"D{r}/E{r}",
                         check_type="calc_text_check",
                         reason="D 계산값과 E 수량 불일치",
                         severity="HIGH",
-                        related_formula=f"D:{d_text} | E:{e_formula}",
-                        actual_value=e_value,
-                        expected_value=expected,
-                        difference=diff,
-                        tol=tol,
+                        related_formula=f"D:{d_text} | E:{e_formula} | BIGO:{bigo}",
+                        actual_value=e_value, expected_value=expected,
+                        difference=diff, tol=tol,
+                        rule_name=f"ROUND({round_digits})"
                     ))
 
-        # -------------------------
-        # 할증 (% 있을 때만)
-        # -------------------------
+        # allowance: 비고% 있을 때만
         m = percent_regex.search(bigo)
         if not m:
             continue
@@ -239,40 +267,43 @@ def main():
 
         if row_type == "installation":
             errors.append(ErrorRecord(
-                row=r,
-                cell=f"E{r}",
+                row=r, cell=f"E{r}",
                 check_type="allowance_policy_check",
-                reason="설치품에 할증% 명시됨",
+                reason="설치품에 할증% 명시됨(정책 위반)",
                 severity="HIGH",
+                related_formula=f"D:{d_text} | E:{e_formula} | BIGO:{bigo}",
+                rule_name=f"비고 {percent_text}"
             ))
             continue
 
         if row_type == "material":
-            d_numeric = safe_eval_numeric(d_text)
+            d_numeric = safe_eval_numeric(d_text) if (d_text and not has_cell_reference(d_text)) else None
             if d_numeric is None or e_value is None:
                 continue
 
             if d_has_multiplier(d_text, multiplier):
                 expected = round(d_numeric, round_digits)
+                rule2 = "D already has multiplier"
             else:
                 expected = round(d_numeric * multiplier, round_digits)
+                rule2 = "D * multiplier"
 
             diff = abs(expected - e_value)
             if diff > tol:
                 errors.append(ErrorRecord(
-                    row=r,
-                    cell=f"E{r}",
+                    row=r, cell=f"E{r}",
                     check_type="allowance_check",
                     reason="비고 할증 적용값과 E 수량 불일치",
                     severity="MEDIUM",
-                    related_formula=f"D:{d_text} | E:{e_formula}",
-                    actual_value=e_value,
-                    expected_value=expected,
-                    difference=diff,
-                    tol=tol,
+                    related_formula=f"D:{d_text} | E:{e_formula} | BIGO:{bigo}",
+                    actual_value=e_value, expected_value=expected,
+                    difference=diff, tol=tol,
+                    rule_name=f"비고 {percent_text} | {rule2}"
                 ))
 
+    csv_path, xlsx_path = build_reports(errors, args.outdir)
     print(f"[완료] 오류 건수: {len(errors)}")
+    print(f"[OK] report saved: {csv_path} / {xlsx_path}")
 
 
 if __name__ == "__main__":
