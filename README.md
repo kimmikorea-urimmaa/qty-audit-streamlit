@@ -1,4 +1,4 @@
-qty-audit
+qty-audit-streamlit
 
 조경 시설물 수량산출서(XLSX)를 자동 검토하는 Streamlit 기반 검증 도구입니다.
 
@@ -79,52 +79,14 @@ Streamlit 화면에서는 중요도(HIGH → MEDIUM → LOW) 순으로 그룹 �
 
 ⸻
 
-📂 프로젝트 구조
+실행 방법  : 로컬 실행
 
-qty-audit-streamlit/
-├── app.py            # Streamlit UI
-├── audit.py          # 검증 엔진
-├── rules.yml         # 할증 및 정책 설정
-├── requirements.txt
-└── README.md
-
-
-⸻
-
-⚙️ 실행 방법
-
-1️⃣ 로컬 실행
+https://qty-audit-app-w3ljddkcngtwwvv4uv6nd7.streamlit.app/
 
 pip install -r requirements.txt
 streamlit run app.py
 
 브라우저에서 XLSX 파일 업로드 후 “검토 실행” 클릭
-
-⸻
-
-2️⃣ CLI 직접 실행
-
-python audit.py sample.xlsx --rules rules.yml --outdir output
-
-출력:
-
-output/report.csv
-output/report.xlsx
-
-
-⸻
-
-📝 rules.yml 예시
-
-round_default_digits: 3
-
-allowance_percent_extract_regex: "(\\d+(\\.\\d+)?)%"
-
-allowance_multiplier_map:
-  "4%": 1.04
-  "5%": 1.05
-  "10%": 1.10
-
 
 ⸻
 
